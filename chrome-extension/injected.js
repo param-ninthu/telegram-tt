@@ -65,38 +65,86 @@
 
       // Find Telegram's file input
       let input = null;
-      const inputs = document.querySelectorAll('input[type="file"]');
+
+      // First try to find existing input
+      let inputs = document.querySelectorAll('input[type="file"]');
+      console.log('[Telegram] Found', inputs.length, 'file inputs');
 
       for (const inp of inputs) {
-        if (inp.accept && (inp.accept.includes('image') || inp.accept.includes('*'))) {
+        const accept = inp.accept || '';
+        if (!accept || accept.includes('image') || accept.includes('*') || accept.includes('/')) {
           input = inp;
+          console.log('[Telegram] Using existing file input');
           break;
         }
       }
 
+      // If no input found, try to trigger attach menu
       if (!input) {
-        // Click attach button to create input
-        const attachButtons = document.querySelectorAll('button, [role="button"]');
-        for (const btn of attachButtons) {
-          if (btn.classList.toString().toLowerCase().includes('attach')) {
-            btn.click();
-            await new Promise(r => setTimeout(r, 100));
+        console.log('[Telegram] No file input found, looking for attach button...');
+
+        // Look for attach button - try multiple selectors
+        const selectors = [
+          '[class*="Attach"]',
+          '[class*="attach"]',
+          'button[aria-label*="ttach"]',
+          'button[title*="ttach"]',
+          '[class*="AttachMenu"]',
+          'button[class*="symbol-attach"]'
+        ];
+
+        let foundButton = false;
+        for (const selector of selectors) {
+          const buttons = document.querySelectorAll(selector);
+          if (buttons.length > 0) {
+            console.log('[Telegram] Found', buttons.length, 'buttons with selector:', selector);
+            buttons[0].click();
+            foundButton = true;
+            await new Promise(r => setTimeout(r, 300));
             break;
           }
         }
 
+        if (!foundButton) {
+          // Try finding any button in the composer area
+          const composer = document.querySelector('[class*="Composer"]') ||
+                          document.querySelector('[class*="composer"]') ||
+                          document.querySelector('[class*="MessageInput"]');
+
+          if (composer) {
+            const buttons = composer.querySelectorAll('button');
+            console.log('[Telegram] Found', buttons.length, 'buttons in composer');
+            // Look for attach-like button (usually has a paperclip icon or similar)
+            for (const btn of buttons) {
+              const classes = btn.className.toLowerCase();
+              if (classes.includes('attach') || classes.includes('symbol')) {
+                console.log('[Telegram] Clicking composer button');
+                btn.click();
+                await new Promise(r => setTimeout(r, 300));
+                break;
+              }
+            }
+          }
+        }
+
         // Try finding input again
-        const newInputs = document.querySelectorAll('input[type="file"]');
-        for (const inp of newInputs) {
-          if (inp.accept && (inp.accept.includes('image') || inp.accept.includes('*'))) {
+        inputs = document.querySelectorAll('input[type="file"]');
+        console.log('[Telegram] After clicking, found', inputs.length, 'file inputs');
+
+        for (const inp of inputs) {
+          const accept = inp.accept || '';
+          if (!accept || accept.includes('image') || accept.includes('*') || accept.includes('/')) {
             input = inp;
+            console.log('[Telegram] Using newly created file input');
             break;
           }
         }
       }
 
       if (!input) {
-        throw new Error('Could not find file input. Make sure chat is open.');
+        console.error('[Telegram] Could not find file input');
+        console.error('[Telegram] Available inputs:', document.querySelectorAll('input[type="file"]'));
+        throw new Error('Could not find file input. Try clicking the attach button manually first.');
       }
 
       // Set file on input

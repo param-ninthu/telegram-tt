@@ -1,0 +1,10 @@
+// Content script - injects the main script into page context
+(function() {
+  // Inject the script into the page context
+  const script = document.createElement('script');
+  script.src = chrome.runtime.getURL('injected.js');
+  script.onload = function() {
+    this.remove();
+  };
+  (document.head || document.documentElement).appendChild(script);
+})();

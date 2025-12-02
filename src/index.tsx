@@ -41,10 +41,6 @@ if (IS_TAURI) {
   setupTauriListeners();
 }
 
-// Expose API for Chrome extension
-(window as any).telegramGetGlobal = getGlobal;
-(window as any).telegramGetActions = getActions;
-
 init();
 
 async function init() {

@@ -291,18 +291,7 @@
       attempts++;
 
       if (!cachedGetGlobal || !cachedGetActions) {
-        // First, check if functions are exposed on window (most reliable)
-        if (typeof window.telegramGetGlobal === 'function') {
-          console.log('[Telegram] Found telegramGetGlobal on window');
-          cachedGetGlobal = window.telegramGetGlobal;
-        }
-
-        if (typeof window.telegramGetActions === 'function') {
-          console.log('[Telegram] Found telegramGetActions on window');
-          cachedGetActions = window.telegramGetActions;
-        }
-
-        // Try other methods as fallback
+        // Try methods in order of reliability
         if (!cachedGetGlobal || !cachedGetActions) {
           searchAllModules();
         }
@@ -324,7 +313,7 @@
           setupAPI();
         } else {
           console.warn('[Telegram] Could not find internal APIs after', attempts, 'attempts');
-          console.warn('[Telegram] Please try refreshing the page and make sure you built Telegram with the exposed APIs');
+          console.warn('[Telegram] Please try refreshing the page');
           setupFallbackAPI();
         }
       }

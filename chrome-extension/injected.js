@@ -1,232 +1,160 @@
 // Chrome Extension for sending disappearing photos on Telegram Web A
-// Hooks into Telegram's internal action system
+// Intercepts file attachments to add TTL parameter
 (function() {
   console.log('[Telegram Disappearing Photos] Loading...');
 
-  let foundActions = null;
-  let foundGetGlobal = null;
+  let pendingTTL = null;
+  let telegramFileInput = null;
 
-  // Comprehensive search for getActions and getGlobal
-  function deepSearch() {
-    console.log('[Telegram] Starting comprehensive search...');
+  // Intercept Promise.all to modify attachment objects
+  const originalPromiseAll = Promise.all;
+  Promise.all = function(promises) {
+    const result = originalPromiseAll.call(this, promises);
 
-    // Method 1: Search all functions in window for getActions/getGlobal
-    function searchObject(obj, path = 'window', visited = new WeakSet(), depth = 0) {
-      if (depth > 5 || !obj || visited.has(obj)) return;
-      if (typeof obj !== 'object' && typeof obj !== 'function') return;
+    // If we have pending TTL, try to modify attachment results
+    if (pendingTTL !== null) {
+      return result.then(values => {
+        // Check if this looks like an array of ApiAttachment objects
+        if (Array.isArray(values) && values.length > 0) {
+          const first = values[0];
+          if (first && typeof first === 'object' &&
+              'blob' in first && 'blobUrl' in first && 'filename' in first) {
+            console.log('[Telegram] ✓ Intercepted attachments, adding TTL:', pendingTTL);
 
-      visited.add(obj);
+            // Add ttlSeconds to all attachments
+            const modified = values.map(att => ({
+              ...att,
+              ttlSeconds: pendingTTL
+            }));
 
-      try {
-        // Check if this object has the methods
-        if (typeof obj.sendMessage === 'function' && !foundActions) {
-          const str = obj.sendMessage.toString();
-          if (str.includes('attachment') || str.includes('chat')) {
-            console.log('[Telegram] Found actions object at:', path);
-            foundActions = obj;
-            return;
+            // Clear pending TTL after a short delay
+            setTimeout(() => { pendingTTL = null; }, 500);
+
+            return modified;
           }
         }
+        return values;
+      });
+    }
 
-        // Check for getGlobal
-        if (typeof obj === 'function') {
-          const str = obj.toString();
-          if (!foundGetGlobal &&
-              str.length < 200 &&
-              str.includes('return') &&
-              (str.includes('global') || str.includes('state')) &&
-              !str.includes('console')) {
-            try {
-              const result = obj();
-              if (result && typeof result === 'object' && result.chats) {
-                console.log('[Telegram] Found getGlobal at:', path);
-                foundGetGlobal = obj;
+    return result;
+  };
+
+  // Monitor for Telegram's file input element
+  function monitorFileInput() {
+    const observer = new MutationObserver(() => {
+      // Look for input[type="file"] that Telegram creates
+      const inputs = document.querySelectorAll('input[type="file"]');
+      inputs.forEach(input => {
+        if (!input.__ttl_patched) {
+          input.__ttl_patched = true;
+
+          // Store reference
+          if (!input.id && input.accept) {
+            telegramFileInput = input;
+            console.log('[Telegram] Detected Telegram file input');
+          }
+        }
+      });
+    });
+
+    observer.observe(document.body, {
+      childList: true,
+      subtree: true
+    });
+  }
+
+  // Main API function
+  window.sendDisappearingPhoto = async function(imageFile, ttlSeconds = null) {
+    try {
+      console.log('[Telegram] Preparing to send disappearing photo...');
+      console.log('[Telegram] TTL:', ttlSeconds === null ? 'view once' : ttlSeconds + 's');
+
+      if (!imageFile || !(imageFile instanceof File || imageFile instanceof Blob)) {
+        throw new Error('Parameter must be a File or Blob');
+      }
+
+      const file = imageFile instanceof File ? imageFile :
+                   new File([imageFile], 'photo.jpg', { type: imageFile.type || 'image/jpeg' });
+
+      if (!file.type.startsWith('image/')) {
+        throw new Error('File must be an image');
+      }
+
+      // Set the pending TTL
+      pendingTTL = ttlSeconds;
+      console.log('[Telegram] Set pending TTL:', pendingTTL);
+
+      // Trigger the attach button to open file dialog
+      const attachButton = document.querySelector('#attach-menu-button, [aria-label*="attach" i], button[aria-label*="attach" i]');
+
+      if (attachButton) {
+        console.log('[Telegram] Clicking attach button...');
+        attachButton.click();
+
+        // Wait for menu to appear
+        await new Promise(resolve => setTimeout(resolve, 100));
+
+        // Click photo/video option
+        const photoOption = Array.from(document.querySelectorAll('.MenuItem, [role="menuitem"]'))
+          .find(el => el.textContent.toLowerCase().includes('photo') ||
+                      el.textContent.toLowerCase().includes('video'));
+
+        if (photoOption) {
+          console.log('[Telegram] Clicking photo option...');
+          photoOption.click();
+
+          // Wait for file input to be ready
+          await new Promise(resolve => setTimeout(resolve, 50));
+
+          // Find the file input and set our file
+          const fileInput = Array.from(document.querySelectorAll('input[type="file"]'))
+            .find(inp => inp.accept && inp.accept.includes('image'));
+
+          if (fileInput) {
+            console.log('[Telegram] Found file input, injecting file...');
+
+            // Create DataTransfer with our file
+            const dataTransfer = new DataTransfer();
+            dataTransfer.items.add(file);
+
+            // Set files and trigger change
+            Object.defineProperty(fileInput, 'files', {
+              value: dataTransfer.files,
+              writable: false
+            });
+
+            const changeEvent = new Event('change', { bubbles: true });
+            fileInput.dispatchEvent(changeEvent);
+
+            console.log('[Telegram] ✓ File dispatched!');
+
+            // Keep TTL active for a bit longer
+            setTimeout(() => {
+              if (pendingTTL !== null) {
+                console.log('[Telegram] Clearing pending TTL');
+                pendingTTL = null;
               }
-            } catch (e) {}
+            }, 2000);
+
+            return { success: true, ttl: ttlSeconds };
+          } else {
+            throw new Error('Could not find file input');
           }
+        } else {
+          throw new Error('Could not find photo/video menu option');
         }
-
-        // Recursively search properties
-        const props = Object.getOwnPropertyNames(obj);
-        for (const prop of props) {
-          if (prop === 'caller' || prop === 'callee' || prop === 'arguments') continue;
-
-          try {
-            const value = obj[prop];
-
-            if (prop === 'getActions' && typeof value === 'function') {
-              try {
-                const actions = value();
-                if (actions && typeof actions.sendMessage === 'function') {
-                  console.log('[Telegram] Found getActions at:', path + '.' + prop);
-                  foundActions = actions;
-                  return;
-                }
-              } catch (e) {}
-            }
-
-            if (prop === 'getGlobal' && typeof value === 'function' && !foundGetGlobal) {
-              try {
-                const global = value();
-                if (global && typeof global === 'object' && global.chats) {
-                  console.log('[Telegram] Found getGlobal at:', path + '.' + prop);
-                  foundGetGlobal = value;
-                }
-              } catch (e) {}
-            }
-
-            if ((typeof value === 'object' || typeof value === 'function') && depth < 5) {
-              searchObject(value, path + '.' + prop, visited, depth + 1);
-            }
-          } catch (e) {}
-        }
-      } catch (e) {}
-    }
-
-    // Search window
-    searchObject(window);
-
-    // Method 2: Search React fiber
-    const root = document.getElementById('root');
-    if (root && !foundActions) {
-      const reactKeys = Object.keys(root).filter(k => k.startsWith('__react'));
-      for (const key of reactKeys) {
-        try {
-          let node = root[key];
-          let depth = 0;
-          while (node && depth < 100 && !foundActions) {
-            if (node.memoizedProps) {
-              searchObject(node.memoizedProps, 'react.fiber.memoizedProps');
-            }
-            if (node.stateNode && node.stateNode.props) {
-              searchObject(node.stateNode.props, 'react.fiber.stateNode.props');
-            }
-            node = node.child || node.sibling || node.return;
-            depth++;
-          }
-        } catch (e) {}
-      }
-    }
-
-    return foundActions && foundGetGlobal;
-  }
-
-  // Initialize
-  let attempts = 0;
-  const maxAttempts = 20;
-
-  const searchInterval = setInterval(() => {
-    attempts++;
-
-    if (!foundActions || !foundGetGlobal) {
-      deepSearch();
-    }
-
-    if ((foundActions && foundGetGlobal) || attempts >= maxAttempts) {
-      clearInterval(searchInterval);
-
-      if (foundActions && foundGetGlobal) {
-        console.log('[Telegram] ✓ Successfully hooked into Telegram APIs!');
-        setupAPI();
       } else {
-        console.warn('[Telegram] Could not find APIs after', attempts, 'attempts');
-        console.warn('[Telegram] Actions found:', !!foundActions);
-        console.warn('[Telegram] GetGlobal found:', !!foundGetGlobal);
-        setupFallbackAPI();
+        throw new Error('Could not find attach button. Make sure a chat is open.');
       }
+    } catch (error) {
+      pendingTTL = null;
+      console.error('[Telegram] Error:', error);
+      throw error;
     }
-  }, 500);
+  };
 
-  // Setup main API
-  function setupAPI() {
-    window.sendDisappearingPhoto = async function(imageFile, ttlSeconds = null) {
-      try {
-        console.log('[Telegram] Sending disappearing photo...');
-        console.log('[Telegram] TTL:', ttlSeconds === null ? 'view once' : ttlSeconds + 's');
-
-        if (!imageFile || !(imageFile instanceof File || imageFile instanceof Blob)) {
-          throw new Error('Parameter must be a File or Blob');
-        }
-
-        const file = imageFile instanceof File ? imageFile :
-                     new File([imageFile], 'photo.jpg', { type: imageFile.type || 'image/jpeg' });
-
-        if (!file.type.startsWith('image/')) {
-          throw new Error('File must be an image');
-        }
-
-        const global = foundGetGlobal();
-        if (!global || !global.chats) {
-          throw new Error('Could not get global state');
-        }
-
-        // Find current chat
-        const tabState = global.byTabId?.[global.currentTabId] || global;
-        const currentChatId = tabState.currentChatId;
-
-        if (!currentChatId) {
-          throw new Error('No chat is open. Please open a chat first.');
-        }
-
-        const chat = global.chats.byId[currentChatId];
-        if (!chat) {
-          throw new Error('Could not find chat.');
-        }
-
-        // Create attachment with TTL
-        const blobUrl = URL.createObjectURL(file);
-        const attachment = {
-          blob: file,
-          blobUrl: blobUrl,
-          filename: file.name || 'photo.jpg',
-          mimeType: file.type,
-          size: file.size,
-          quick: {
-            width: 0,
-            height: 0
-          },
-          ttlSeconds: ttlSeconds
-        };
-
-        // Call sendMessage action
-        foundActions.sendMessage({
-          chat: chat,
-          attachment: attachment,
-          tabId: global.currentTabId || 0
-        });
-
-        console.log('[Telegram] ✓ Disappearing photo sent!');
-        console.log('[Telegram] TTL:', ttlSeconds === null ? 'view once' : ttlSeconds + ' seconds');
-
-        return { success: true, ttl: ttlSeconds };
-      } catch (error) {
-        console.error('[Telegram] Error:', error);
-        throw error;
-      }
-    };
-
-    printHelp();
-  }
-
-  // Fallback API
-  function setupFallbackAPI() {
-    window.sendDisappearingPhoto = async function() {
-      throw new Error('Extension could not hook into Telegram APIs. Try refreshing the page.');
-    };
-
-    window.sendDisappearingPhotoFromUrl = async function() {
-      throw new Error('Extension could not hook into Telegram APIs. Try refreshing the page.');
-    };
-
-    window.sendDisappearingPhotoFromInput = async function() {
-      throw new Error('Extension could not hook into Telegram APIs. Try refreshing the page.');
-    };
-
-    console.log('[Telegram] Extension loaded but API access failed.');
-    console.log('[Telegram] Try refreshing Telegram Web A and waiting a bit longer.');
-  }
-
-  // Helper functions
+  // Helper: Load from URL
   window.sendDisappearingPhotoFromUrl = async function(url, ttlSeconds = null) {
     try {
       console.log('[Telegram] Fetching:', url);
@@ -244,6 +172,7 @@
     }
   };
 
+  // Helper: Open file picker
   window.sendDisappearingPhotoFromInput = async function(ttlSeconds = null) {
     return new Promise((resolve, reject) => {
       const input = document.createElement('input');
@@ -271,18 +200,28 @@
     console.log('');
     console.log('%c✓ Extension ready!', 'color: #00cc88; font-weight: bold');
     console.log('');
-    console.log('%cFunctions:', 'font-weight: bold');
+    console.log('%cUsage:', 'font-weight: bold');
     console.log('');
-    console.log('%c1. sendDisappearingPhoto(file, ttlSeconds)', 'color: #00cc88');
-    console.log('   ttlSeconds: null (view once) or number (seconds)');
+    console.log('%c1. Open a chat in Telegram Web A', 'color: #888');
+    console.log('%c2. Run one of these functions in the console:', 'color: #888');
+    console.log('');
+    console.log('%csendDisappearingPhoto(file, ttlSeconds)', 'color: #00cc88');
+    console.log('   • file: File or Blob object');
+    console.log('   • ttlSeconds: null (view once) or number (seconds)');
     console.log('   %cExample: sendDisappearingPhoto(myFile, null)', 'color: #888');
     console.log('');
-    console.log('%c2. sendDisappearingPhotoFromUrl(url, ttlSeconds)', 'color: #00cc88');
+    console.log('%csendDisappearingPhotoFromUrl(url, ttlSeconds)', 'color: #00cc88');
+    console.log('   • Downloads and sends photo from URL');
     console.log('   %cExample: sendDisappearingPhotoFromUrl("https://picsum.photos/200", 5)', 'color: #888');
     console.log('');
-    console.log('%c3. sendDisappearingPhotoFromInput(ttlSeconds)', 'color: #00cc88');
+    console.log('%csendDisappearingPhotoFromInput(ttlSeconds)', 'color: #00cc88');
+    console.log('   • Opens file picker to select photo');
     console.log('   %cExample: sendDisappearingPhotoFromInput(10)', 'color: #888');
     console.log('');
-    console.log('%c⚠️  Open a chat before sending!', 'color: #ff8800; font-weight: bold');
+    console.log('%c⚠️  Make sure a chat is open before sending!', 'color: #ff8800; font-weight: bold');
   }
+
+  // Initialize
+  monitorFileInput();
+  printHelp();
 })();

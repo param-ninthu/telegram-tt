@@ -5,9 +5,15 @@
  * internal API functions and exposes them globally for sending
  * disappearing (self-destructing) photos from the DevTools console.
  *
- * NOTE: The current Telegram Web A codebase has a bug where ttlSeconds
- * is not passed for photos in the uploadMedia function. This extension
- * works around this by patching the function at runtime.
+ * ARCHITECTURE NOTE:
+ * Telegram Web A uses a web worker for API calls. The actual functions
+ * like `sendApiMessage` and `uploadMedia` run inside the worker.
+ * From the main thread (where this extension runs), we can only access:
+ * - getActions().sendMessage() - dispatches the send action
+ * - callApi('sendMessage', ...) - sends message to worker
+ *
+ * The source code fixes in messages.ts and messageContent.ts enable
+ * proper TTL support when using these interfaces.
  */
 
 (function() {
@@ -27,7 +33,9 @@
     _getActions: null,
     _getCurrentTabId: null,
     _callApi: null,
-    _uploadMediaPatched: false,
+    _cancelApiProgress: null,
+    _messagesModule: null,
+    _buildAttachment: null,
   };
 
   /**
@@ -67,7 +75,6 @@
 
       if (chunkArrays.length === 0) {
         warn('No webpack chunk arrays found, waiting...');
-        // Wait and retry
         setTimeout(() => {
           const retryArrays = findWebpackChunkArrays();
           if (retryArrays.length > 0) {
@@ -212,18 +219,24 @@
     if (typeof exports.getGlobal === 'function' && typeof exports.getActions === 'function') {
       TelegramApi._getGlobal = exports.getGlobal;
       TelegramApi._getActions = exports.getActions;
-      log(`Found global state module (${moduleId})`);
+      log(`Found global state module (${moduleId}): getGlobal, getActions`);
     }
 
     // Check for getCurrentTabId
-    if (typeof exports.getCurrentTabId === 'function') {
+    if (typeof exports.getCurrentTabId === 'function' && !TelegramApi._getCurrentTabId) {
       TelegramApi._getCurrentTabId = exports.getCurrentTabId;
+      log(`Found getCurrentTabId (${moduleId})`);
     }
 
-    // Check for callApi
+    // Check for callApi from worker/connector
     if (typeof exports.callApi === 'function') {
       TelegramApi._callApi = exports.callApi;
       log(`Found callApi (${moduleId})`);
+    }
+
+    // Check for cancelApiProgress
+    if (typeof exports.cancelApiProgress === 'function') {
+      TelegramApi._cancelApiProgress = exports.cancelApiProgress;
     }
 
     // Check for GramJS
@@ -232,14 +245,23 @@
       log(`Found GramJS (${moduleId})`);
     }
 
-    // Check for invokeRequest
-    if (typeof exports.invokeRequest === 'function') {
-      TelegramApi._invokeRequest = exports.invokeRequest;
-      log(`Found invokeRequest (${moduleId})`);
+    // Check for buildAttachment utility
+    if (typeof exports.default === 'function') {
+      const fnStr = exports.default.toString();
+      if (fnStr.includes('blobUrl') && fnStr.includes('filename') && fnStr.includes('mimeType')) {
+        TelegramApi._buildAttachment = exports.default;
+        log(`Found buildAttachment (${moduleId})`);
+      }
+    }
+
+    // Check for message-related exports (sendMessage, sendApiMessage, etc.)
+    if (exports.sendMessage || exports.sendApiMessage || exports.sendMessageLocal) {
+      TelegramApi._messagesModule = exports;
+      log(`Found messages module (${moduleId}):`, Object.keys(exports).filter(k => typeof exports[k] === 'function').slice(0, 10));
     }
 
     // Check default exports
-    if (exports.default) {
+    if (exports.default && typeof exports.default === 'object') {
       analyzeModuleExports(moduleId + '.default', exports.default);
     }
   }
@@ -248,13 +270,20 @@
    * Log summary of found modules
    */
   function logFoundModules() {
+    log('');
     log('=== Module Discovery Summary ===');
     log('  getGlobal:', !!TelegramApi._getGlobal);
     log('  getActions:', !!TelegramApi._getActions);
     log('  getCurrentTabId:', !!TelegramApi._getCurrentTabId);
     log('  callApi:', !!TelegramApi._callApi);
     log('  GramJS:', !!TelegramApi._GramJs);
-    log('  invokeRequest:', !!TelegramApi._invokeRequest);
+    log('  messagesModule:', !!TelegramApi._messagesModule);
+    log('  buildAttachment:', !!TelegramApi._buildAttachment);
+
+    if (TelegramApi._messagesModule) {
+      const fns = Object.keys(TelegramApi._messagesModule).filter(k => typeof TelegramApi._messagesModule[k] === 'function');
+      log('  Messages module functions:', fns);
+    }
   }
 
   /**
@@ -278,7 +307,6 @@
 
       // Ensure it's an image type
       if (!blob.type.startsWith('image/')) {
-        // Try to detect from URL or default to JPEG
         const ext = url.split('.').pop()?.toLowerCase();
         const mimeTypes = {
           'jpg': 'image/jpeg',
@@ -313,7 +341,7 @@
 
       img.onerror = () => {
         URL.revokeObjectURL(url);
-        resolve({ width: 512, height: 512 }); // Default fallback
+        resolve({ width: 512, height: 512 });
       };
 
       img.src = url;
@@ -376,6 +404,18 @@
    * Build attachment object compatible with Telegram Web A
    */
   async function buildAttachment(blob, filename, ttlSeconds) {
+    // Try to use Telegram's own buildAttachment if available
+    if (TelegramApi._buildAttachment) {
+      try {
+        const attachment = await TelegramApi._buildAttachment(filename, blob, { ttlSeconds });
+        log('Built attachment using Telegram buildAttachment');
+        return attachment;
+      } catch (e) {
+        warn('Failed to use Telegram buildAttachment, using custom:', e.message);
+      }
+    }
+
+    // Fallback to custom implementation
     const blobUrl = URL.createObjectURL(blob);
     const dimensions = await getImageDimensions(blob);
 
@@ -398,7 +438,7 @@
   /**
    * Send disappearing photo using getActions().sendMessage
    */
-  async function sendViaActions(chatId, attachment, ttlSeconds) {
+  async function sendViaActions(chatId, attachment) {
     if (!TelegramApi._getActions) {
       throw new Error('getActions not available');
     }
@@ -410,11 +450,8 @@
 
     const tabId = TelegramApi._getCurrentTabId ? TelegramApi._getCurrentTabId() : undefined;
 
-    // The attachment already has ttlSeconds, which should be passed through
-    // However, due to the bug in uploadMedia, photos don't get TTL
-    // We'll send it anyway and log a warning
     log('Sending via actions.sendMessage...');
-    log('Note: TTL for photos requires a code fix in uploadMedia function');
+    log('Attachment ttlSeconds:', attachment.ttlSeconds);
 
     actions.sendMessage({
       chatId: chatId,
@@ -426,71 +463,27 @@
   }
 
   /**
-   * Alternative: Send as document to preserve TTL
-   * This works but the media appears as a document, not a photo
+   * Send via callApi (direct worker communication)
    */
-  async function sendAsDocument(chatId, attachment, ttlSeconds) {
-    if (!TelegramApi._getActions) {
-      throw new Error('getActions not available');
+  async function sendViaCallApi(chatId, attachment) {
+    if (!TelegramApi._callApi) {
+      throw new Error('callApi not available');
     }
 
-    const actions = TelegramApi._getActions();
-    if (!actions || !actions.sendMessage) {
-      throw new Error('sendMessage action not found');
+    const chat = getChat(chatId);
+    if (!chat) {
+      throw new Error(`Chat ${chatId} not found in global state`);
     }
 
-    const tabId = TelegramApi._getCurrentTabId ? TelegramApi._getCurrentTabId() : undefined;
+    log('Sending via callApi...');
 
-    // Force sending as file/document to ensure TTL is applied
-    const docAttachment = {
-      ...attachment,
-      shouldSendAsFile: true,
-      ttlSeconds: ttlSeconds,
-    };
-
-    log('Sending as document with TTL...');
-
-    actions.sendMessage({
-      chatId: chatId,
-      attachments: [docAttachment],
-      tabId: tabId,
+    // callApi('sendMessage', params) - this goes to the worker
+    const result = await TelegramApi._callApi('sendMessage', {
+      chat: chat,
+      attachment: attachment,
     });
 
-    return true;
-  }
-
-  /**
-   * Try to patch the uploadMedia function to support TTL for photos
-   * This modifies Telegram's internal function at runtime
-   */
-  async function patchUploadMedia() {
-    if (TelegramApi._uploadMediaPatched) return true;
-
-    const require = TelegramApi._webpackRequire;
-    if (!require || !require.c) {
-      warn('Cannot patch uploadMedia: webpack require not available');
-      return false;
-    }
-
-    // Search for the module containing InputMediaUploadedPhoto usage
-    for (const [moduleId, cachedModule] of Object.entries(require.c)) {
-      if (!cachedModule || !cachedModule.exports) continue;
-
-      const exports = cachedModule.exports;
-
-      // Look for uploadMedia function or module with photo upload
-      const fnStr = cachedModule.exports.toString?.() || '';
-      if (fnStr.includes('InputMediaUploadedPhoto') && fnStr.includes('ttlSeconds')) {
-        log(`Found potential uploadMedia module: ${moduleId}`);
-        // This module likely contains the function we need to patch
-        // Due to how webpack bundles code, patching is complex
-      }
-    }
-
-    // For now, we can't easily patch the function due to webpack bundling
-    // The proper fix requires modifying the source code
-    warn('Runtime patching not implemented. TTL for photos requires source code modification.');
-    return false;
+    return !!result;
   }
 
   /**
@@ -499,11 +492,9 @@
    * @param {string} url - URL of the image to download and send
    * @param {number} ttlSeconds - Time-to-live in seconds. Use 2147483647 for "view once"
    * @param {string|number} chatId - Optional chat ID (uses current chat if not provided)
-   * @param {object} options - Additional options
-   * @param {boolean} options.asDocument - Force send as document (guarantees TTL but shows as file)
    * @returns {Promise<boolean>}
    */
-  async function sendDisappearingPhoto(url, ttlSeconds = VIEW_ONCE_TTL, chatId = null, options = {}) {
+  async function sendDisappearingPhoto(url, ttlSeconds = VIEW_ONCE_TTL, chatId = null) {
     log('========================================');
     log('  TelegramSendDisappearingPhoto');
     log('========================================');
@@ -534,7 +525,7 @@
     // Verify chat exists
     const chat = getChat(targetChatId);
     if (!chat) {
-      warn(`Chat ${targetChatId} not found in cache. Proceeding anyway...`);
+      warn(`Chat ${targetChatId} not found in cache. This may cause issues.`);
     } else {
       log(`Chat title: ${chat.title || 'N/A'}`);
     }
@@ -544,10 +535,10 @@
     const blob = await downloadImage(url);
     const filename = `photo_${Date.now()}.${blob.type.split('/')[1] || 'jpg'}`;
 
-    // Build attachment
-    log('Building attachment...');
+    // Build attachment with TTL
+    log('Building attachment with TTL...');
     const attachment = await buildAttachment(blob, filename, ttlSeconds);
-    log('Attachment built:', {
+    log('Attachment:', {
       filename: attachment.filename,
       size: attachment.size,
       dimensions: attachment.quick,
@@ -555,32 +546,61 @@
     });
 
     // Try to send
-    try {
-      if (options.asDocument) {
-        log('Sending as document (TTL will be applied)...');
-        await sendAsDocument(targetChatId, attachment, ttlSeconds);
-        log('SUCCESS: Sent as document with TTL');
-      } else {
-        log('Attempting to send as photo...');
-        await sendViaActions(targetChatId, attachment, ttlSeconds);
-        log('Message sent!');
-        warn(
-          'IMPORTANT: Due to a limitation in Telegram Web A, TTL may not be applied to photos.\n' +
-          'The ttlSeconds field is extracted but not passed to InputMediaUploadedPhoto.\n' +
-          'To guarantee TTL, use: TelegramSendDisappearingPhoto(url, ttl, chatId, {asDocument: true})'
-        );
+    let success = false;
+    let lastError = null;
+
+    // Method 1: Use getActions().sendMessage()
+    if (TelegramApi._getActions) {
+      try {
+        log('Attempting Method 1: getActions().sendMessage()');
+        success = await sendViaActions(targetChatId, attachment);
+        if (success) {
+          log('SUCCESS via getActions().sendMessage()');
+        }
+      } catch (e) {
+        warn('Method 1 failed:', e.message);
+        lastError = e;
       }
-
-      // Cleanup
-      URL.revokeObjectURL(attachment.blobUrl);
-
-      return true;
-    } catch (e) {
-      // Cleanup on error
-      URL.revokeObjectURL(attachment.blobUrl);
-      error('Failed to send:', e);
-      throw e;
     }
+
+    // Method 2: Use callApi('sendMessage', ...)
+    if (!success && TelegramApi._callApi) {
+      try {
+        log('Attempting Method 2: callApi("sendMessage", ...)');
+        success = await sendViaCallApi(targetChatId, attachment);
+        if (success) {
+          log('SUCCESS via callApi()');
+        }
+      } catch (e) {
+        warn('Method 2 failed:', e.message);
+        lastError = e;
+      }
+    }
+
+    // Cleanup
+    if (attachment.blobUrl) {
+      URL.revokeObjectURL(attachment.blobUrl);
+    }
+
+    if (!success) {
+      throw lastError || new Error('All send methods failed');
+    }
+
+    log('========================================');
+    log('  Message sent successfully!');
+    log('========================================');
+
+    return true;
+  }
+
+  /**
+   * Wrapper for callApi - allows direct API calls
+   */
+  function callApi(methodName, ...args) {
+    if (!TelegramApi._callApi) {
+      throw new Error('callApi not available. Make sure Telegram is fully loaded.');
+    }
+    return TelegramApi._callApi(methodName, ...args);
   }
 
   /**
@@ -649,24 +669,34 @@
     log('Hooking into webpack...');
     await hookWebpack();
 
-    // Try to patch uploadMedia
-    await patchUploadMedia();
-
     // Expose API globally
     window.TelegramApi = {
-      // Core functions
+      // Direct access to internal functions (main thread only)
       getGlobal: TelegramApi._getGlobal,
       getActions: TelegramApi._getActions,
-      callApi: TelegramApi._callApi,
+      getCurrentTabId: TelegramApi._getCurrentTabId,
+
+      // API communication (sends messages to worker)
+      callApi: callApi,
+
+      // GramJS classes (for reference)
       GramJs: TelegramApi._GramJs,
+
+      // Messages module (exported functions from messages.ts)
+      // Note: These run in worker context when called via callApi
+      messages: TelegramApi._messagesModule,
+
+      // Utilities
+      buildAttachment: buildAttachment,
+      downloadImage: downloadImage,
+      getCurrentChatId: getCurrentChatId,
+      getChat: getChat,
 
       // Debug utilities
       debugGlobalState,
       debugActions,
-      getCurrentChatId,
-      getChat,
 
-      // Internal state (for debugging)
+      // Internal state (for advanced debugging)
       _internal: TelegramApi,
     };
 
@@ -682,30 +712,44 @@
     log('  INITIALIZATION COMPLETE');
     log('========================================');
     log('');
-    log('USAGE:');
-    log('  await TelegramSendDisappearingPhoto(url, ttlSeconds, chatId?, options?)');
+    log('EXPOSED GLOBALS:');
     log('');
-    log('EXAMPLES:');
-    log('  // Send view-once photo to current chat:');
+    log('  window.TelegramSendDisappearingPhoto(url, ttlSeconds?, chatId?)');
+    log('    - Main helper function for sending disappearing photos');
+    log('');
+    log('  window.TelegramApi.getGlobal()');
+    log('    - Get the current global state');
+    log('');
+    log('  window.TelegramApi.getActions()');
+    log('    - Get all action dispatchers (sendMessage, etc.)');
+    log('');
+    log('  window.TelegramApi.callApi(methodName, ...args)');
+    log('    - Call any API method directly (communicates with worker)');
+    log('');
+    log('  window.TelegramApi.messages');
+    log('    - Messages module with exported functions');
+    if (TelegramApi._messagesModule) {
+      const fns = Object.keys(TelegramApi._messagesModule).filter(k => typeof TelegramApi._messagesModule[k] === 'function');
+      log('    - Available:', fns.slice(0, 5).join(', '), fns.length > 5 ? `... (${fns.length} total)` : '');
+    }
+    log('');
+    log('USAGE EXAMPLES:');
+    log('');
+    log('  // Send view-once photo:');
     log('  await TelegramSendDisappearingPhoto("https://picsum.photos/400/300")');
     log('');
     log('  // Send with 5-second TTL:');
     log('  await TelegramSendDisappearingPhoto("https://picsum.photos/400/300", 5)');
     log('');
-    log('  // Send to specific chat:');
-    log('  await TelegramSendDisappearingPhoto("https://picsum.photos/400/300", 5, "123456789")');
+    log('  // Get current chat:');
+    log('  TelegramApi.getCurrentChatId()');
     log('');
-    log('  // Send as document (guarantees TTL):');
-    log('  await TelegramSendDisappearingPhoto("https://picsum.photos/400/300", 5, null, {asDocument: true})');
+    log('  // Call API directly:');
+    log('  await TelegramApi.callApi("fetchMessages", { chat, ... })');
     log('');
-    log('TTL VALUES:');
-    log('  2147483647 = View once (default)');
-    log('  1-86400 = Seconds until self-destruct');
-    log('');
-    log('DEBUG:');
-    log('  TelegramApi.debugGlobalState()  - Inspect global state');
-    log('  TelegramApi.debugActions()      - List available actions');
-    log('  TelegramApi.getCurrentChatId()  - Get current chat ID');
+    log('NOTE: sendApiMessage and uploadMedia are internal worker functions.');
+    log('      They cannot be called directly from the main thread.');
+    log('      Use TelegramSendDisappearingPhoto or getActions().sendMessage() instead.');
     log('');
 
     // Status check

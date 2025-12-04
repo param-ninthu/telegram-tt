@@ -48,6 +48,11 @@ export const getGlobal = typed.getGlobal;
 export const setGlobal = typed.setGlobal;
 export const getActions = typed.getActions;
 export const getPromiseActions = typed.getPromiseActions;
+
+// Expose globally for extension access
+(window as any).getGlobal = getGlobal;
+(window as any).setGlobal = setGlobal;
+(window as any).getActions = getActions;
 export const addActionHandler = typed.addActionHandler as <ActionName extends ProjectActionNames>(
   name: ActionName,
   handler: ActionHandlers[ActionName],

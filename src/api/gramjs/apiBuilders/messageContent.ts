@@ -126,11 +126,6 @@ export function buildMessageMediaContent(
     if (video) return { video, ttlSeconds };
   }
 
-  // Other disappearing media types are not supported
-  if (ttlSeconds !== undefined) {
-    return undefined;
-  }
-
   if (media instanceof GramJs.MessageMediaInvoice && media.extendedMedia instanceof GramJs.MessageExtendedMedia) {
     return buildMessageMediaContent(media.extendedMedia.media, context);
   }
@@ -139,11 +134,16 @@ export function buildMessageMediaContent(
   if (sticker) return { sticker };
 
   const photo = buildPhoto(media);
-  if (photo) return { photo };
+  if (photo) return { photo, ttlSeconds };
 
   const video = buildVideo(media);
   const altVideos = buildAltVideos(media);
-  if (video) return { video, altVideos };
+  if (video) return { video, altVideos, ttlSeconds };
+
+  // Other disappearing media types are not supported
+  if (ttlSeconds !== undefined) {
+    return undefined;
+  }
 
   const audio = buildAudio(media);
   if (audio) return { audio };

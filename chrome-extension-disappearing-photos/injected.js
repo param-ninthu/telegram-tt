@@ -3,6 +3,7 @@
  *
  * Hooks into Telegram Web A's webpack modules to access internal APIs.
  * Uses known module IDs from production build analysis.
+ * Patches Worker scripts to enable TTL for photos.
  */
 
 (function() {
@@ -10,6 +11,86 @@
 
   const LOG_PREFIX = '[TelegramDisappearingPhotos]';
   const VIEW_ONCE_TTL = 2147483647;
+
+  // ========================================
+  // Worker Patching - Must run FIRST
+  // ========================================
+
+  /**
+   * Patch the Worker script to add ttlSeconds to InputMediaUploadedPhoto.
+   * The production code at line 14220-14223 creates InputMediaUploadedPhoto
+   * without ttlSeconds, but the variable 'f' containing ttlSeconds is available.
+   */
+  function patchWorkerScript(scriptContent) {
+    // Pattern: InputMediaUploadedPhoto without ttlSeconds
+    // Original code (lines 14220-14223):
+    //   return new Ke.InputMediaUploadedPhoto({
+    //       file: _,
+    //       spoiler: l
+    //   });
+
+    // We need to add: ttlSeconds: f
+    // The variable 'f' is destructured at line 14195: ttlSeconds: f
+
+    // Use regex to match the pattern with flexible whitespace
+    const pattern = /(return\s+new\s+\w+\.InputMediaUploadedPhoto\s*\(\s*\{\s*file:\s*_,\s*spoiler:\s*l)(\s*\}\s*\))/g;
+
+    const patched = scriptContent.replace(pattern, '$1,ttlSeconds:f$2');
+
+    const wasPatched = patched !== scriptContent;
+    if (wasPatched) {
+      console.log(LOG_PREFIX, 'Successfully patched InputMediaUploadedPhoto to include ttlSeconds');
+    }
+
+    return { content: patched, patched: wasPatched };
+  }
+
+  /**
+   * Intercept Worker creation to patch Telegram's worker scripts
+   */
+  const OriginalWorker = window.Worker;
+  let workerPatched = false;
+
+  window.Worker = function(scriptURL, options) {
+    const urlStr = scriptURL instanceof URL ? scriptURL.href : String(scriptURL);
+
+    // Only patch Telegram worker scripts (typically numbered chunks like 2026.*.js)
+    if (urlStr.includes('.js') && (urlStr.includes('telegram') || /\/\d+\.[a-f0-9]+\.js/.test(urlStr))) {
+      console.log(LOG_PREFIX, 'Intercepting Worker:', urlStr);
+
+      try {
+        // Fetch the worker script synchronously
+        const xhr = new XMLHttpRequest();
+        xhr.open('GET', urlStr, false); // Synchronous
+        xhr.send();
+
+        if (xhr.status === 200) {
+          const { content, patched } = patchWorkerScript(xhr.responseText);
+
+          if (patched) {
+            workerPatched = true;
+            // Create a blob with the patched content
+            const blob = new Blob([content], { type: 'application/javascript' });
+            const patchedUrl = URL.createObjectURL(blob);
+
+            console.log(LOG_PREFIX, 'Creating Worker with patched script');
+            return new OriginalWorker(patchedUrl, options);
+          }
+        }
+      } catch (e) {
+        console.warn(LOG_PREFIX, 'Failed to patch Worker:', e.message);
+      }
+    }
+
+    // Fall back to original Worker
+    return new OriginalWorker(scriptURL, options);
+  };
+
+  // Copy static properties
+  window.Worker.prototype = OriginalWorker.prototype;
+  Object.setPrototypeOf(window.Worker, OriginalWorker);
+
+  console.log(LOG_PREFIX, 'Worker interceptor installed');
 
   // Known module IDs from production build analysis
   const KNOWN_MODULES = {
@@ -418,6 +499,7 @@
     log('Status:');
     log('  getGlobal:', !!TelegramApi._getGlobal);
     log('  getActions:', !!TelegramApi._getActions);
+    log('  Worker patched:', workerPatched);
     log('');
     log('Usage:');
     log('  // Create or get an image blob, then:');
@@ -432,6 +514,11 @@
     if (!TelegramApi._getGlobal || !TelegramApi._getActions) {
       warn('Could not find required functions.');
       warn('The module IDs may have changed in this build.');
+    }
+
+    if (!workerPatched) {
+      warn('Worker was not patched. Disappearing photos may not work.');
+      warn('The Worker script pattern may have changed in this build.');
     }
   }
 

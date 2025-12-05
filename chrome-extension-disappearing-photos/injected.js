@@ -290,8 +290,11 @@
         const ctx = canvas.getContext('2d');
         ctx.drawImage(img, 0, 0);
 
+        // Create preview image for thumbnail
+        const previewDataUrl = canvas.toDataURL('image/jpeg', 0.8);
+
         // Create a video stream from the canvas
-        const stream = canvas.captureStream(1); // 1 FPS
+        const stream = canvas.captureStream(30); // 30 FPS for smoother encoding
         const mediaRecorder = new MediaRecorder(stream, {
           mimeType: 'video/webm;codecs=vp8',
           videoBitsPerSecond: 2500000, // 2.5 Mbps for good quality
@@ -309,6 +312,7 @@
             videoBlob,
             width: img.naturalWidth,
             height: img.naturalHeight,
+            previewDataUrl,
           });
         };
 
@@ -316,12 +320,12 @@
           reject(new Error('MediaRecorder error: ' + e.error));
         };
 
-        // Record for a minimal duration (100ms is enough for a single frame)
+        // Record for 500ms to ensure we have valid video frames
         mediaRecorder.start();
         setTimeout(() => {
           mediaRecorder.stop();
           stream.getTracks().forEach(track => track.stop());
-        }, 100);
+        }, 500);
       };
 
       img.onerror = () => {
@@ -331,6 +335,21 @@
 
       img.src = url;
     });
+  }
+
+  /**
+   * Convert data URL to Blob
+   */
+  function dataUrlToBlob(dataUrl) {
+    const parts = dataUrl.split(',');
+    const mime = parts[0].match(/:(.*?);/)[1];
+    const bstr = atob(parts[1]);
+    let n = bstr.length;
+    const u8arr = new Uint8Array(n);
+    while (n--) {
+      u8arr[n] = bstr.charCodeAt(n);
+    }
+    return new Blob([u8arr], { type: mime });
   }
 
   /**
@@ -354,8 +373,16 @@
    * Build attachment for video with ttlSeconds support.
    * Production Worker supports ttlSeconds for videos (InputMediaUploadedDocument).
    */
-  async function buildVideoAttachment(videoBlob, filename, ttlSeconds, width, height) {
+  async function buildVideoAttachment(videoBlob, filename, ttlSeconds, width, height, previewDataUrl) {
     const blobUrl = URL.createObjectURL(videoBlob);
+
+    // Create preview blob URL if we have preview data
+    let previewBlobUrl;
+    if (previewDataUrl) {
+      const previewBlob = dataUrlToBlob(previewDataUrl);
+      previewBlobUrl = URL.createObjectURL(previewBlob);
+    }
+
     return {
       blob: videoBlob,
       blobUrl,
@@ -365,8 +392,9 @@
       quick: {
         width,
         height,
-        duration: 0, // Minimal duration (will be a still frame)
+        duration: 1, // 1 second duration (minimal but valid)
       },
+      previewBlobUrl,
       ttlSeconds,
       uniqueId: `video_${Date.now()}_${Math.random().toString(36).slice(2)}`,
     };
@@ -407,10 +435,11 @@
     // Convert image to video for ttlSeconds support
     // (Production Worker only supports ttlSeconds for videos/documents)
     log('Converting image to video for TTL support...');
-    const { videoBlob, width, height } = await convertImageToVideo(imageBlob);
+    const { videoBlob, width, height, previewDataUrl } = await convertImageToVideo(imageBlob);
 
     const filename = `disappearing_${Date.now()}.webm`;
-    const attachment = await buildVideoAttachment(videoBlob, filename, ttlSeconds, width, height);
+    const attachment = await buildVideoAttachment(videoBlob, filename, ttlSeconds, width, height, previewDataUrl);
+    log(`Built video attachment: ${JSON.stringify({ size: attachment.size, width, height, hasTtl: !!attachment.ttlSeconds })}`);
 
     const actions = TelegramApi._getActions();
 

@@ -238,6 +238,29 @@
     return blob;
   }
 
+  /**
+   * Validate that the blob is an image
+   */
+  function validateImageBlob(blob) {
+    if (!(blob instanceof Blob)) {
+      throw new Error('Input must be a Blob');
+    }
+
+    const validImageTypes = [
+      'image/jpeg',
+      'image/png',
+      'image/gif',
+      'image/webp',
+      'image/bmp'
+    ];
+
+    if (!blob.type || !validImageTypes.includes(blob.type)) {
+      throw new Error(`Invalid image type: ${blob.type || 'unknown'}. Supported: ${validImageTypes.join(', ')}`);
+    }
+
+    return true;
+  }
+
   function getImageDimensions(blob) {
     return new Promise(resolve => {
       const url = URL.createObjectURL(blob);
@@ -262,10 +285,19 @@
     };
   }
 
-  async function sendDisappearingPhoto(url, ttlSeconds = VIEW_ONCE_TTL, chatId = null) {
+  /**
+   * Send a disappearing photo
+   * @param {Blob} imageBlob - Image blob (must be image/jpeg, image/png, image/gif, image/webp, or image/bmp)
+   * @param {number} ttlSeconds - Time to live in seconds (default: 2147483647 for view-once)
+   * @param {string|number|null} chatId - Chat ID (default: current open chat)
+   */
+  async function sendDisappearingPhoto(imageBlob, ttlSeconds = VIEW_ONCE_TTL, chatId = null) {
     log('========================================');
     log('  TelegramSendDisappearingPhoto');
     log('========================================');
+
+    // Validate input is an image blob
+    validateImageBlob(imageBlob);
 
     if (!TelegramApi._getActions) {
       throw new Error('getActions not found. Cannot send messages.');
@@ -276,13 +308,14 @@
       throw new Error('No chat open. Open a chat or provide chatId.');
     }
 
-    log(`URL: ${url}`);
+    log(`Blob: ${imageBlob.size} bytes, ${imageBlob.type}`);
     log(`TTL: ${ttlSeconds}${ttlSeconds === VIEW_ONCE_TTL ? ' (view once)' : 's'}`);
     log(`Chat: ${targetChatId}`);
 
-    const blob = await downloadImage(url);
-    const filename = `photo_${Date.now()}.jpg`;
-    const attachment = await buildAttachment(blob, filename, ttlSeconds);
+    // Get file extension from mime type
+    const ext = imageBlob.type.split('/')[1] || 'jpg';
+    const filename = `photo_${Date.now()}.${ext}`;
+    const attachment = await buildAttachment(imageBlob, filename, ttlSeconds);
 
     const actions = TelegramApi._getActions();
 
@@ -371,7 +404,13 @@
     log('  getActions:', !!TelegramApi._getActions);
     log('');
     log('Usage:');
-    log('  await TelegramSendDisappearingPhoto("https://picsum.photos/400", 5)');
+    log('  // Create or get an image blob, then:');
+    log('  await TelegramSendDisappearingPhoto(imageBlob, 5);');
+    log('');
+    log('  // Example with fetch:');
+    log('  const resp = await fetch("https://picsum.photos/400");');
+    log('  const blob = await resp.blob();');
+    log('  await TelegramSendDisappearingPhoto(blob);');
     log('');
 
     if (!TelegramApi._getGlobal || !TelegramApi._getActions) {

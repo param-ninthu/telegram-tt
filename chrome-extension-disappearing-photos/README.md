@@ -29,22 +29,27 @@ A Chrome Extension that enables sending disappearing (self-destructing) photos p
 6. Use the `TelegramSendDisappearingPhoto` function:
 
 ```javascript
+// First, get an image blob (from fetch, file input, canvas, etc.)
+const response = await fetch("https://picsum.photos/400/300");
+const imageBlob = await response.blob();
+
 // Send a view-once photo to the current chat
-await TelegramSendDisappearingPhoto("https://picsum.photos/400/300");
+await TelegramSendDisappearingPhoto(imageBlob);
 
 // Send with 5-second TTL
-await TelegramSendDisappearingPhoto("https://picsum.photos/400/300", 5);
+await TelegramSendDisappearingPhoto(imageBlob, 5);
 
 // Send to a specific chat by ID
-await TelegramSendDisappearingPhoto("https://picsum.photos/400/300", 5, "123456789");
+await TelegramSendDisappearingPhoto(imageBlob, 5, "123456789");
 
-// Send as document (guarantees TTL is applied)
-await TelegramSendDisappearingPhoto("https://picsum.photos/400/300", 5, null, {asDocument: true});
+// Using a file input
+const file = document.querySelector('input[type="file"]').files[0];
+await TelegramSendDisappearingPhoto(file, 10);
 ```
 
 ## API Reference
 
-### TelegramSendDisappearingPhoto(url, ttlSeconds, chatId, options)
+### TelegramSendDisappearingPhoto(imageBlob, ttlSeconds, chatId)
 
 Sends a disappearing photo to a Telegram chat.
 
@@ -52,13 +57,18 @@ Sends a disappearing photo to a Telegram chat.
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `url` | string | (required) | URL of the image to download and send |
+| `imageBlob` | Blob | (required) | Image blob (must be image/jpeg, image/png, image/gif, image/webp, or image/bmp) |
 | `ttlSeconds` | number | `2147483647` | Time-to-live in seconds. Use `2147483647` for "view once" |
 | `chatId` | string/number | `null` | Chat ID to send to. If not provided, uses the currently open chat |
-| `options` | object | `{}` | Additional options |
-| `options.asDocument` | boolean | `false` | If `true`, sends as a document file (guarantees TTL) |
 
 **Returns:** `Promise<boolean>` - `true` if the message was sent successfully
+
+**Supported Image Types:**
+- `image/jpeg`
+- `image/png`
+- `image/gif`
+- `image/webp`
+- `image/bmp`
 
 **TTL Values:**
 - `2147483647` - View once (recipient can only view once, then it disappears)
@@ -86,22 +96,9 @@ TelegramApi.getChat("123456789");
 
 ### TTL for Photos
 
-**Important:** Due to a limitation in the current Telegram Web A codebase, the `ttlSeconds` parameter is extracted from attachments but **not passed** to `InputMediaUploadedPhoto` when uploading photos. This means:
-
-1. **Photos sent via this extension may not have TTL applied** on the server side
-2. **Documents (files) DO support TTL** - use `{asDocument: true}` option to guarantee TTL
+**Important:** Due to a limitation in the current Telegram Web A codebase, the `ttlSeconds` parameter is extracted from attachments but **not passed** to `InputMediaUploadedPhoto` when uploading photos. This means photos sent via this extension may not have TTL applied on the server side.
 
 This is a bug in the Telegram Web A source code, not in this extension. The `uploadMedia` function in `src/api/gramjs/methods/messages.ts` needs to be modified to include `ttlSeconds` in the `InputMediaUploadedPhoto` constructor.
-
-### Workaround
-
-To ensure TTL is applied, send the image as a document:
-
-```javascript
-await TelegramSendDisappearingPhoto("https://picsum.photos/400/300", 5, null, {asDocument: true});
-```
-
-This will appear as a file attachment rather than an inline photo, but the TTL will be properly applied.
 
 ## Debugging
 

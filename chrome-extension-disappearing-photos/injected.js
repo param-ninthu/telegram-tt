@@ -1,8 +1,8 @@
 /**
  * Telegram Disappearing Photos - Injected Script
  *
- * Finds Telegram's internal functions by analyzing webpack modules
- * and checking function return values for expected structures.
+ * Hooks into Telegram Web A's webpack modules to access internal APIs.
+ * Uses known module IDs from production build analysis.
  */
 
 (function() {
@@ -11,12 +11,20 @@
   const LOG_PREFIX = '[TelegramDisappearingPhotos]';
   const VIEW_ONCE_TTL = 2147483647;
 
+  // Known module IDs from production build analysis
+  const KNOWN_MODULES = {
+    // Module 13439 exports: mS=getGlobal, UF=setGlobal, ko=getActions
+    GLOBAL_MODULE_ID: '13439',
+    // Module 37932 exports: cl=typify
+    TEACTN_MODULE_ID: '37932'
+  };
+
   const TelegramApi = {
     _initialized: false,
     _webpackRequire: null,
     _getGlobal: null,
     _getActions: null,
-    _getCurrentTabId: null,
+    _setGlobal: null,
   };
 
   function log(...args) { console.log(LOG_PREFIX, ...args); }
@@ -24,198 +32,198 @@
   function error(...args) { console.error(LOG_PREFIX, ...args); }
 
   /**
-   * Check if object looks like Telegram's global state
+   * Check window globals (DEBUG mode)
    */
-  function isGlobalState(obj) {
-    if (!obj || typeof obj !== 'object') return false;
-    // Global state has these characteristic properties
-    return (
-      'byTabId' in obj ||
-      ('chats' in obj && 'users' in obj) ||
-      ('settings' in obj && 'messages' in obj)
-    );
-  }
-
-  /**
-   * Check if object looks like Telegram's actions object
-   */
-  function isActionsObject(obj) {
-    if (!obj || typeof obj !== 'object') return false;
-    const keys = Object.keys(obj);
-    if (keys.length < 10) return false;
-
-    // Actions object has many functions including sendMessage
-    const fnCount = keys.filter(k => typeof obj[k] === 'function').length;
-    const hasCommonActions = (
-      typeof obj.sendMessage === 'function' ||
-      typeof obj.openChat === 'function' ||
-      typeof obj.loadChats === 'function'
-    );
-
-    return fnCount > 20 && hasCommonActions;
-  }
-
-  /**
-   * Find webpack chunk array
-   */
-  function findWebpackChunk() {
-    for (const key of Object.keys(window)) {
-      if (key.startsWith('webpackChunk') && Array.isArray(window[key])) {
-        return window[key];
-      }
+  function checkWindowGlobals() {
+    if (typeof window.getGlobal === 'function') {
+      TelegramApi._getGlobal = window.getGlobal;
+      log('Found window.getGlobal');
     }
-    return null;
+    if (typeof window.getActions === 'function') {
+      TelegramApi._getActions = window.getActions;
+      log('Found window.getActions');
+    }
+    if (typeof window.setGlobal === 'function') {
+      TelegramApi._setGlobal = window.setGlobal;
+    }
+    return TelegramApi._getGlobal && TelegramApi._getActions;
   }
 
   /**
-   * Hook webpack and capture require function
+   * Hook webpack to get require function
    */
   function hookWebpack() {
     return new Promise((resolve) => {
-      // Check window globals first
-      if (typeof window.getGlobal === 'function') {
-        TelegramApi._getGlobal = window.getGlobal;
-        log('Found window.getGlobal');
-      }
-      if (typeof window.getActions === 'function') {
-        TelegramApi._getActions = window.getActions;
-        log('Found window.getActions');
-      }
+      // Try self.webpackChunktelegram_t (production) or window variants
+      const chunkName = 'webpackChunktelegram_t';
+      const chunk = self[chunkName] || window[chunkName];
 
-      if (TelegramApi._getGlobal && TelegramApi._getActions) {
-        resolve(true);
-        return;
-      }
-
-      const chunk = findWebpackChunk();
       if (!chunk) {
+        // Try to find any webpack chunk
+        for (const key of Object.keys(self)) {
+          if (key.startsWith('webpackChunk') && Array.isArray(self[key])) {
+            log(`Found chunk: ${key}`);
+            hookChunkArray(self[key], resolve);
+            return;
+          }
+        }
         warn('No webpack chunk found');
         resolve(false);
         return;
       }
 
-      log('Found webpack chunk, hooking...');
-      const origPush = chunk.push.bind(chunk);
-
-      // Inject to capture require
-      const hookId = `__tdp_${Date.now()}__`;
-      try {
-        origPush([
-          [hookId],
-          { [hookId]: function(m, e, r) {
-            if (r && r.c) searchModules(r);
-          }},
-          function(r) {
-            if (r && r.c) searchModules(r);
-            try { r(hookId); } catch(e) {}
-          }
-        ]);
-      } catch (e) {}
-
-      // Also search existing modules
-      setTimeout(() => {
-        if (TelegramApi._webpackRequire) {
-          searchModules(TelegramApi._webpackRequire);
-        }
-        resolve(TelegramApi._getGlobal && TelegramApi._getActions);
-      }, 1000);
-
-      setTimeout(() => resolve(false), 5000);
+      log(`Found ${chunkName}`);
+      hookChunkArray(chunk, resolve);
     });
   }
 
   /**
-   * Search all modules for getGlobal and getActions by behavior
+   * Hook into chunk array to capture require
    */
-  function searchModules(require) {
-    if (!require || !require.c) return;
-    TelegramApi._webpackRequire = require;
+  function hookChunkArray(chunk, resolve) {
+    const origPush = chunk.push.bind(chunk);
 
-    const cache = require.c;
-    log(`Searching ${Object.keys(cache).length} modules by behavior...`);
-
-    for (const [moduleId, module] of Object.entries(cache)) {
-      if (TelegramApi._getGlobal && TelegramApi._getActions) break;
-      if (!module || !module.exports) continue;
-
-      const exports = module.exports;
-
-      // Search all exported functions
-      searchExports(exports, moduleId);
-
-      // Check default export too
-      if (exports.default) {
-        searchExports(exports.default, moduleId + '.default');
-      }
+    // Inject our module to capture require
+    const hookId = `__tdp_${Date.now()}__`;
+    try {
+      origPush([
+        [hookId],
+        { [hookId]: function(module, exports, require) {
+          captureRequire(require);
+        }},
+        function(require) {
+          captureRequire(require);
+          try { require(hookId); } catch(e) {}
+        }
+      ]);
+    } catch(e) {
+      warn('Hook failed:', e.message);
     }
 
-    logStatus();
+    setTimeout(() => resolve(!!TelegramApi._getGlobal), 3000);
   }
 
   /**
-   * Search exports for our target functions
+   * Capture webpack require and extract functions
    */
-  function searchExports(exports, moduleId) {
-    if (!exports || typeof exports !== 'object') return;
+  function captureRequire(require) {
+    if (!require || TelegramApi._webpackRequire) return;
+    TelegramApi._webpackRequire = require;
+    log('Captured webpack require');
 
-    for (const key of Object.keys(exports)) {
-      if (typeof exports[key] !== 'function') continue;
+    // Method 1: Try known module ID directly
+    tryKnownModules(require);
 
-      try {
-        // Call the function with no args and check result
-        const result = exports[key]();
-
-        if (!TelegramApi._getGlobal && isGlobalState(result)) {
-          TelegramApi._getGlobal = exports[key];
-          log(`Found getGlobal: ${moduleId}.${key}`);
-        }
-
-        if (!TelegramApi._getActions && isActionsObject(result)) {
-          TelegramApi._getActions = exports[key];
-          log(`Found getActions: ${moduleId}.${key}`);
-        }
-
-        // Check for getCurrentTabId
-        if (key.toLowerCase().includes('tab') && typeof result === 'number') {
-          TelegramApi._getCurrentTabId = exports[key];
-        }
-      } catch (e) {
-        // Function threw - not what we're looking for
-      }
+    // Method 2: Search all modules if Method 1 failed
+    if (!TelegramApi._getGlobal || !TelegramApi._getActions) {
+      searchModules(require);
     }
   }
 
-  function logStatus() {
-    log('');
-    log('=== Status ===');
-    log('  getGlobal:', !!TelegramApi._getGlobal);
-    log('  getActions:', !!TelegramApi._getActions);
+  /**
+   * Try to load known module IDs
+   */
+  function tryKnownModules(require) {
+    try {
+      // Try module 13439 (global/index.ts in production)
+      const globalModule = require(KNOWN_MODULES.GLOBAL_MODULE_ID);
+      if (globalModule) {
+        log('Found module 13439');
+        // Check for minified export names: mS, ko, UF
+        if (typeof globalModule.mS === 'function') {
+          TelegramApi._getGlobal = globalModule.mS;
+          log('Found getGlobal as mS');
+        }
+        if (typeof globalModule.ko === 'function') {
+          TelegramApi._getActions = globalModule.ko;
+          log('Found getActions as ko');
+        }
+        if (typeof globalModule.UF === 'function') {
+          TelegramApi._setGlobal = globalModule.UF;
+        }
+      }
+    } catch(e) {
+      log('Module 13439 not found, searching...');
+    }
+
+    // Try teactn module to get typify
+    try {
+      const teactnModule = require(KNOWN_MODULES.TEACTN_MODULE_ID);
+      if (teactnModule && typeof teactnModule.cl === 'function') {
+        log('Found teactn module 37932');
+        const typed = teactnModule.cl();
+        if (typed) {
+          if (!TelegramApi._getGlobal && typed.getGlobal) {
+            TelegramApi._getGlobal = typed.getGlobal;
+            log('Found getGlobal via typify');
+          }
+          if (!TelegramApi._getActions && typed.getActions) {
+            TelegramApi._getActions = typed.getActions;
+            log('Found getActions via typify');
+          }
+        }
+      }
+    } catch(e) {}
+  }
+
+  /**
+   * Search all modules for getGlobal/getActions
+   */
+  function searchModules(require) {
+    if (!require.c) return;
+    log(`Searching ${Object.keys(require.c).length} modules...`);
+
+    for (const [id, module] of Object.entries(require.c)) {
+      if (TelegramApi._getGlobal && TelegramApi._getActions) break;
+      if (!module || !module.exports) continue;
+
+      const exp = module.exports;
+
+      // Look for exports that look like getGlobal (returns object with byTabId/chats)
+      for (const key of Object.keys(exp)) {
+        if (typeof exp[key] !== 'function') continue;
+        try {
+          const result = exp[key]();
+          if (result && typeof result === 'object') {
+            // Check for global state shape
+            if (!TelegramApi._getGlobal &&
+                (result.byTabId || (result.chats && result.users))) {
+              TelegramApi._getGlobal = exp[key];
+              log(`Found getGlobal: module ${id}, export ${key}`);
+            }
+            // Check for actions shape (many functions, including openChat/loadChats)
+            if (!TelegramApi._getActions) {
+              const fns = Object.values(result).filter(v => typeof v === 'function');
+              if (fns.length > 50) {
+                TelegramApi._getActions = exp[key];
+                log(`Found getActions: module ${id}, export ${key}`);
+              }
+            }
+          }
+        } catch(e) {}
+      }
+    }
   }
 
   function getCurrentChatId() {
     if (!TelegramApi._getGlobal) return null;
     try {
       const global = TelegramApi._getGlobal();
-      const tabId = TelegramApi._getCurrentTabId ? TelegramApi._getCurrentTabId() : 0;
-
       if (global.byTabId) {
-        const state = global.byTabId[tabId] || Object.values(global.byTabId)[0];
-        if (state?.currentChat?.id) return state.currentChat.id;
+        const tabs = Object.values(global.byTabId);
+        for (const tab of tabs) {
+          if (tab.currentChat?.id) return tab.currentChat.id;
+        }
       }
       return null;
-    } catch (e) {
-      return null;
-    }
+    } catch(e) { return null; }
   }
 
   function getChat(chatId) {
     if (!TelegramApi._getGlobal) return null;
     try {
-      const global = TelegramApi._getGlobal();
-      return global.chats?.byId?.[chatId] || null;
-    } catch (e) {
-      return null;
-    }
+      return TelegramApi._getGlobal().chats?.byId?.[chatId] || null;
+    } catch(e) { return null; }
   }
 
   async function downloadImage(url) {
@@ -260,7 +268,7 @@
     log('========================================');
 
     if (!TelegramApi._getActions) {
-      throw new Error('getActions not found. Extension cannot send messages.');
+      throw new Error('getActions not found. Cannot send messages.');
     }
 
     const targetChatId = chatId || getCurrentChatId();
@@ -277,13 +285,31 @@
     const attachment = await buildAttachment(blob, filename, ttlSeconds);
 
     const actions = TelegramApi._getActions();
-    const tabId = TelegramApi._getCurrentTabId ? TelegramApi._getCurrentTabId() : undefined;
+
+    // Find sendMessage action - it might be minified
+    let sendFn = actions.sendMessage;
+    if (!sendFn) {
+      // Search for a function that takes chatId and attachments
+      for (const [key, fn] of Object.entries(actions)) {
+        if (typeof fn === 'function') {
+          const fnStr = fn.toString();
+          if (fnStr.includes('attachments') || fnStr.includes('chatId')) {
+            sendFn = fn;
+            log(`Using action: ${key}`);
+            break;
+          }
+        }
+      }
+    }
+
+    if (!sendFn) {
+      throw new Error('sendMessage action not found');
+    }
 
     log('Sending...');
-    actions.sendMessage({
+    sendFn({
       chatId: targetChatId,
       attachments: [attachment],
-      tabId,
     });
 
     URL.revokeObjectURL(attachment.blobUrl);
@@ -300,23 +326,34 @@
       await new Promise(r => window.addEventListener('load', r));
     }
 
-    log('Waiting for Telegram to load...');
+    log('Waiting for Telegram...');
     await new Promise(r => setTimeout(r, 4000));
 
-    await hookWebpack();
+    // Check DEBUG mode globals first
+    if (checkWindowGlobals()) {
+      log('Using DEBUG mode globals');
+    } else {
+      // Hook webpack
+      await hookWebpack();
+    }
 
-    // Retry search a few times
+    // Retry a few times
     for (let i = 0; i < 3 && (!TelegramApi._getGlobal || !TelegramApi._getActions); i++) {
       log(`Retry ${i + 1}...`);
       await new Promise(r => setTimeout(r, 2000));
       if (TelegramApi._webpackRequire) {
-        searchModules(TelegramApi._webpackRequire);
+        tryKnownModules(TelegramApi._webpackRequire);
+        if (!TelegramApi._getGlobal || !TelegramApi._getActions) {
+          searchModules(TelegramApi._webpackRequire);
+        }
       }
     }
 
+    // Expose API
     window.TelegramApi = {
-      getGlobal: () => TelegramApi._getGlobal ? TelegramApi._getGlobal() : null,
-      getActions: () => TelegramApi._getActions ? TelegramApi._getActions() : null,
+      getGlobal: () => TelegramApi._getGlobal?.() || null,
+      getActions: () => TelegramApi._getActions?.() || null,
+      setGlobal: TelegramApi._setGlobal,
       getCurrentChatId,
       getChat,
       _internal: TelegramApi,
@@ -329,17 +366,17 @@
     log('  READY');
     log('========================================');
     log('');
+    log('Status:');
+    log('  getGlobal:', !!TelegramApi._getGlobal);
+    log('  getActions:', !!TelegramApi._getActions);
+    log('');
     log('Usage:');
     log('  await TelegramSendDisappearingPhoto("https://picsum.photos/400", 5)');
     log('');
 
-    logStatus();
-
     if (!TelegramApi._getGlobal || !TelegramApi._getActions) {
-      warn('');
       warn('Could not find required functions.');
-      warn('Make sure Telegram Web A is fully loaded.');
-      warn('');
+      warn('The module IDs may have changed in this build.');
     }
   }
 

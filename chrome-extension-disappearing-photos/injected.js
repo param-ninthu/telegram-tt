@@ -3,7 +3,6 @@
  *
  * Hooks into Telegram Web A's webpack modules to access internal APIs.
  * Uses known module IDs from production build analysis.
- * Patches Worker scripts to enable TTL for photos.
  */
 
 (function() {
@@ -11,86 +10,6 @@
 
   const LOG_PREFIX = '[TelegramDisappearingPhotos]';
   const VIEW_ONCE_TTL = 2147483647;
-
-  // ========================================
-  // Worker Patching - Must run FIRST
-  // ========================================
-
-  /**
-   * Patch the Worker script to add ttlSeconds to InputMediaUploadedPhoto.
-   * The production code at line 14220-14223 creates InputMediaUploadedPhoto
-   * without ttlSeconds, but the variable 'f' containing ttlSeconds is available.
-   */
-  function patchWorkerScript(scriptContent) {
-    // Pattern: InputMediaUploadedPhoto without ttlSeconds
-    // Original code (lines 14220-14223):
-    //   return new Ke.InputMediaUploadedPhoto({
-    //       file: _,
-    //       spoiler: l
-    //   });
-
-    // We need to add: ttlSeconds: f
-    // The variable 'f' is destructured at line 14195: ttlSeconds: f
-
-    // Use regex to match the pattern with flexible whitespace
-    const pattern = /(return\s+new\s+\w+\.InputMediaUploadedPhoto\s*\(\s*\{\s*file:\s*_,\s*spoiler:\s*l)(\s*\}\s*\))/g;
-
-    const patched = scriptContent.replace(pattern, '$1,ttlSeconds:f$2');
-
-    const wasPatched = patched !== scriptContent;
-    if (wasPatched) {
-      console.log(LOG_PREFIX, 'Successfully patched InputMediaUploadedPhoto to include ttlSeconds');
-    }
-
-    return { content: patched, patched: wasPatched };
-  }
-
-  /**
-   * Intercept Worker creation to patch Telegram's worker scripts
-   */
-  const OriginalWorker = window.Worker;
-  let workerPatched = false;
-
-  window.Worker = function(scriptURL, options) {
-    const urlStr = scriptURL instanceof URL ? scriptURL.href : String(scriptURL);
-
-    // Only patch Telegram worker scripts (typically numbered chunks like 2026.*.js)
-    if (urlStr.includes('.js') && (urlStr.includes('telegram') || /\/\d+\.[a-f0-9]+\.js/.test(urlStr))) {
-      console.log(LOG_PREFIX, 'Intercepting Worker:', urlStr);
-
-      try {
-        // Fetch the worker script synchronously
-        const xhr = new XMLHttpRequest();
-        xhr.open('GET', urlStr, false); // Synchronous
-        xhr.send();
-
-        if (xhr.status === 200) {
-          const { content, patched } = patchWorkerScript(xhr.responseText);
-
-          if (patched) {
-            workerPatched = true;
-            // Create a blob with the patched content
-            const blob = new Blob([content], { type: 'application/javascript' });
-            const patchedUrl = URL.createObjectURL(blob);
-
-            console.log(LOG_PREFIX, 'Creating Worker with patched script');
-            return new OriginalWorker(patchedUrl, options);
-          }
-        }
-      } catch (e) {
-        console.warn(LOG_PREFIX, 'Failed to patch Worker:', e.message);
-      }
-    }
-
-    // Fall back to original Worker
-    return new OriginalWorker(scriptURL, options);
-  };
-
-  // Copy static properties
-  window.Worker.prototype = OriginalWorker.prototype;
-  Object.setPrototypeOf(window.Worker, OriginalWorker);
-
-  console.log(LOG_PREFIX, 'Worker interceptor installed');
 
   // Known module IDs from production build analysis
   const KNOWN_MODULES = {
@@ -352,7 +271,72 @@
     });
   }
 
-  async function buildAttachment(blob, filename, ttlSeconds) {
+  /**
+   * Convert an image blob to a video blob (single frame).
+   * This is needed because the production Worker only supports ttlSeconds for videos,
+   * not for photos. By converting to video, we can enable disappearing functionality.
+   */
+  async function convertImageToVideo(imageBlob) {
+    return new Promise((resolve, reject) => {
+      const img = new Image();
+      const url = URL.createObjectURL(imageBlob);
+
+      img.onload = () => {
+        URL.revokeObjectURL(url);
+
+        const canvas = document.createElement('canvas');
+        canvas.width = img.naturalWidth;
+        canvas.height = img.naturalHeight;
+        const ctx = canvas.getContext('2d');
+        ctx.drawImage(img, 0, 0);
+
+        // Create a video stream from the canvas
+        const stream = canvas.captureStream(1); // 1 FPS
+        const mediaRecorder = new MediaRecorder(stream, {
+          mimeType: 'video/webm;codecs=vp8',
+          videoBitsPerSecond: 2500000, // 2.5 Mbps for good quality
+        });
+
+        const chunks = [];
+        mediaRecorder.ondataavailable = (e) => {
+          if (e.data.size > 0) chunks.push(e.data);
+        };
+
+        mediaRecorder.onstop = () => {
+          const videoBlob = new Blob(chunks, { type: 'video/webm' });
+          log(`Converted image to video: ${videoBlob.size} bytes`);
+          resolve({
+            videoBlob,
+            width: img.naturalWidth,
+            height: img.naturalHeight,
+          });
+        };
+
+        mediaRecorder.onerror = (e) => {
+          reject(new Error('MediaRecorder error: ' + e.error));
+        };
+
+        // Record for a minimal duration (100ms is enough for a single frame)
+        mediaRecorder.start();
+        setTimeout(() => {
+          mediaRecorder.stop();
+          stream.getTracks().forEach(track => track.stop());
+        }, 100);
+      };
+
+      img.onerror = () => {
+        URL.revokeObjectURL(url);
+        reject(new Error('Failed to load image'));
+      };
+
+      img.src = url;
+    });
+  }
+
+  /**
+   * Build attachment for photo (no ttlSeconds support in production)
+   */
+  async function buildPhotoAttachment(blob, filename) {
     const blobUrl = URL.createObjectURL(blob);
     const dims = await getImageDimensions(blob);
     return {
@@ -362,13 +346,39 @@
       mimeType: blob.type || 'image/jpeg',
       size: blob.size,
       quick: { width: dims.width, height: dims.height },
-      ttlSeconds,
       uniqueId: `photo_${Date.now()}_${Math.random().toString(36).slice(2)}`,
     };
   }
 
   /**
-   * Send a disappearing photo
+   * Build attachment for video with ttlSeconds support.
+   * Production Worker supports ttlSeconds for videos (InputMediaUploadedDocument).
+   */
+  async function buildVideoAttachment(videoBlob, filename, ttlSeconds, width, height) {
+    const blobUrl = URL.createObjectURL(videoBlob);
+    return {
+      blob: videoBlob,
+      blobUrl,
+      filename,
+      mimeType: 'video/webm',
+      size: videoBlob.size,
+      quick: {
+        width,
+        height,
+        duration: 0, // Minimal duration (will be a still frame)
+      },
+      ttlSeconds,
+      uniqueId: `video_${Date.now()}_${Math.random().toString(36).slice(2)}`,
+    };
+  }
+
+  /**
+   * Send a disappearing photo (as a single-frame video to enable TTL support)
+   *
+   * NOTE: Due to production Worker limitations, photos don't support ttlSeconds.
+   * This function converts the image to a minimal video to enable disappearing functionality.
+   * The recipient will see it as a very short video (essentially a still frame).
+   *
    * @param {Blob} imageBlob - Image blob (must be image/jpeg, image/png, image/gif, image/webp, or image/bmp)
    * @param {number} ttlSeconds - Time to live in seconds (default: 2147483647 for view-once)
    * @param {string|number|null} chatId - Chat ID (default: current open chat)
@@ -390,14 +400,17 @@
       throw new Error('No chat open. Open a chat or provide chatId.');
     }
 
-    log(`Blob: ${imageBlob.size} bytes, ${imageBlob.type}`);
+    log(`Image: ${imageBlob.size} bytes, ${imageBlob.type}`);
     log(`TTL: ${ttlSeconds}${ttlSeconds === VIEW_ONCE_TTL ? ' (view once)' : 's'}`);
     log(`Chat: ${targetChatId}`);
 
-    // Get file extension from mime type
-    const ext = imageBlob.type.split('/')[1] || 'jpg';
-    const filename = `photo_${Date.now()}.${ext}`;
-    const attachment = await buildAttachment(imageBlob, filename, ttlSeconds);
+    // Convert image to video for ttlSeconds support
+    // (Production Worker only supports ttlSeconds for videos/documents)
+    log('Converting image to video for TTL support...');
+    const { videoBlob, width, height } = await convertImageToVideo(imageBlob);
+
+    const filename = `disappearing_${Date.now()}.webm`;
+    const attachment = await buildVideoAttachment(videoBlob, filename, ttlSeconds, width, height);
 
     const actions = TelegramApi._getActions();
 
@@ -425,7 +438,7 @@
     // threadId -1 = MAIN_THREAD_ID, type 'thread' = regular chat
     const MAIN_THREAD_ID = -1;
 
-    log('Sending...');
+    log('Sending disappearing video (converted from image)...');
     try {
       sendFn({
         messageList: {
@@ -437,8 +450,59 @@
       });
 
       log('Message dispatched!');
-      // Note: We don't revoke blobUrl immediately as the upload is async
-      // The URL will be garbage collected eventually
+      log('Note: Sent as a short video due to production TTL limitations for photos.');
+      return true;
+    } catch (e) {
+      error('Failed to send:', e.message);
+      URL.revokeObjectURL(attachment.blobUrl);
+      return false;
+    }
+  }
+
+  /**
+   * Send a regular photo (without disappearing/TTL)
+   * @param {Blob} imageBlob - Image blob
+   * @param {string|number|null} chatId - Chat ID (default: current open chat)
+   */
+  async function sendPhoto(imageBlob, chatId = null) {
+    log('========================================');
+    log('  TelegramSendPhoto (regular)');
+    log('========================================');
+
+    validateImageBlob(imageBlob);
+
+    if (!TelegramApi._getActions) {
+      throw new Error('getActions not found. Cannot send messages.');
+    }
+
+    const targetChatId = chatId || getCurrentChatId();
+    if (!targetChatId) {
+      throw new Error('No chat open. Open a chat or provide chatId.');
+    }
+
+    const ext = imageBlob.type.split('/')[1] || 'jpg';
+    const filename = `photo_${Date.now()}.${ext}`;
+    const attachment = await buildPhotoAttachment(imageBlob, filename);
+
+    const actions = TelegramApi._getActions();
+    const sendFn = actions.sendMessage;
+
+    if (!sendFn) {
+      throw new Error('sendMessage action not found');
+    }
+
+    const MAIN_THREAD_ID = -1;
+
+    try {
+      sendFn({
+        messageList: {
+          chatId: String(targetChatId),
+          threadId: MAIN_THREAD_ID,
+          type: 'thread',
+        },
+        attachments: [attachment],
+      });
+      log('Photo sent!');
       return true;
     } catch (e) {
       error('Failed to send:', e.message);
@@ -490,6 +554,7 @@
     };
 
     window.TelegramSendDisappearingPhoto = sendDisappearingPhoto;
+    window.TelegramSendPhoto = sendPhoto;
 
     log('');
     log('========================================');
@@ -499,26 +564,26 @@
     log('Status:');
     log('  getGlobal:', !!TelegramApi._getGlobal);
     log('  getActions:', !!TelegramApi._getActions);
-    log('  Worker patched:', workerPatched);
     log('');
     log('Usage:');
-    log('  // Create or get an image blob, then:');
-    log('  await TelegramSendDisappearingPhoto(imageBlob, 5);');
-    log('');
-    log('  // Example with fetch:');
+    log('  // Send disappearing photo (view-once):');
     log('  const resp = await fetch("https://picsum.photos/400");');
     log('  const blob = await resp.blob();');
     log('  await TelegramSendDisappearingPhoto(blob);');
+    log('');
+    log('  // With custom TTL (in seconds):');
+    log('  await TelegramSendDisappearingPhoto(blob, 10);');
+    log('');
+    log('  // Send regular photo:');
+    log('  await TelegramSendPhoto(blob);');
+    log('');
+    log('Note: Disappearing photos are sent as short videos');
+    log('      due to production Worker TTL limitations.');
     log('');
 
     if (!TelegramApi._getGlobal || !TelegramApi._getActions) {
       warn('Could not find required functions.');
       warn('The module IDs may have changed in this build.');
-    }
-
-    if (!workerPatched) {
-      warn('Worker was not patched. Disappearing photos may not work.');
-      warn('The Worker script pattern may have changed in this build.');
     }
   }
 

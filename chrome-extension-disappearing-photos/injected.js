@@ -271,91 +271,7 @@
     });
   }
 
-  /**
-   * Convert an image blob to a video blob (single frame).
-   * This is needed because the production Worker only supports ttlSeconds for videos,
-   * not for photos. By converting to video, we can enable disappearing functionality.
-   */
-  async function convertImageToVideo(imageBlob) {
-    return new Promise((resolve, reject) => {
-      const img = new Image();
-      const url = URL.createObjectURL(imageBlob);
-
-      img.onload = () => {
-        URL.revokeObjectURL(url);
-
-        const canvas = document.createElement('canvas');
-        canvas.width = img.naturalWidth;
-        canvas.height = img.naturalHeight;
-        const ctx = canvas.getContext('2d');
-        ctx.drawImage(img, 0, 0);
-
-        // Create preview image for thumbnail
-        const previewDataUrl = canvas.toDataURL('image/jpeg', 0.8);
-
-        // Create a video stream from the canvas
-        const stream = canvas.captureStream(30); // 30 FPS for smoother encoding
-        const mediaRecorder = new MediaRecorder(stream, {
-          mimeType: 'video/webm;codecs=vp8',
-          videoBitsPerSecond: 2500000, // 2.5 Mbps for good quality
-        });
-
-        const chunks = [];
-        mediaRecorder.ondataavailable = (e) => {
-          if (e.data.size > 0) chunks.push(e.data);
-        };
-
-        mediaRecorder.onstop = () => {
-          const videoBlob = new Blob(chunks, { type: 'video/webm' });
-          log(`Converted image to video: ${videoBlob.size} bytes`);
-          resolve({
-            videoBlob,
-            width: img.naturalWidth,
-            height: img.naturalHeight,
-            previewDataUrl,
-          });
-        };
-
-        mediaRecorder.onerror = (e) => {
-          reject(new Error('MediaRecorder error: ' + e.error));
-        };
-
-        // Record for 500ms to ensure we have valid video frames
-        mediaRecorder.start();
-        setTimeout(() => {
-          mediaRecorder.stop();
-          stream.getTracks().forEach(track => track.stop());
-        }, 500);
-      };
-
-      img.onerror = () => {
-        URL.revokeObjectURL(url);
-        reject(new Error('Failed to load image'));
-      };
-
-      img.src = url;
-    });
-  }
-
-  /**
-   * Convert data URL to Blob
-   */
-  function dataUrlToBlob(dataUrl) {
-    const parts = dataUrl.split(',');
-    const mime = parts[0].match(/:(.*?);/)[1];
-    const bstr = atob(parts[1]);
-    let n = bstr.length;
-    const u8arr = new Uint8Array(n);
-    while (n--) {
-      u8arr[n] = bstr.charCodeAt(n);
-    }
-    return new Blob([u8arr], { type: mime });
-  }
-
-  /**
-   * Build attachment for photo (no ttlSeconds support in production)
-   */
-  async function buildPhotoAttachment(blob, filename) {
+  async function buildAttachment(blob, filename, ttlSeconds) {
     const blobUrl = URL.createObjectURL(blob);
     const dims = await getImageDimensions(blob);
     return {
@@ -365,48 +281,13 @@
       mimeType: blob.type || 'image/jpeg',
       size: blob.size,
       quick: { width: dims.width, height: dims.height },
+      ttlSeconds,
       uniqueId: `photo_${Date.now()}_${Math.random().toString(36).slice(2)}`,
     };
   }
 
   /**
-   * Build attachment for video with ttlSeconds support.
-   * Production Worker supports ttlSeconds for videos (InputMediaUploadedDocument).
-   */
-  async function buildVideoAttachment(videoBlob, filename, ttlSeconds, width, height, previewDataUrl) {
-    const blobUrl = URL.createObjectURL(videoBlob);
-
-    // Create preview blob URL if we have preview data
-    let previewBlobUrl;
-    if (previewDataUrl) {
-      const previewBlob = dataUrlToBlob(previewDataUrl);
-      previewBlobUrl = URL.createObjectURL(previewBlob);
-    }
-
-    return {
-      blob: videoBlob,
-      blobUrl,
-      filename,
-      mimeType: 'video/webm',
-      size: videoBlob.size,
-      quick: {
-        width,
-        height,
-        duration: 1, // 1 second duration (minimal but valid)
-      },
-      previewBlobUrl,
-      ttlSeconds,
-      uniqueId: `video_${Date.now()}_${Math.random().toString(36).slice(2)}`,
-    };
-  }
-
-  /**
-   * Send a disappearing photo (as a single-frame video to enable TTL support)
-   *
-   * NOTE: Due to production Worker limitations, photos don't support ttlSeconds.
-   * This function converts the image to a minimal video to enable disappearing functionality.
-   * The recipient will see it as a very short video (essentially a still frame).
-   *
+   * Send a disappearing photo
    * @param {Blob} imageBlob - Image blob (must be image/jpeg, image/png, image/gif, image/webp, or image/bmp)
    * @param {number} ttlSeconds - Time to live in seconds (default: 2147483647 for view-once)
    * @param {string|number|null} chatId - Chat ID (default: current open chat)
@@ -428,18 +309,14 @@
       throw new Error('No chat open. Open a chat or provide chatId.');
     }
 
-    log(`Image: ${imageBlob.size} bytes, ${imageBlob.type}`);
+    log(`Blob: ${imageBlob.size} bytes, ${imageBlob.type}`);
     log(`TTL: ${ttlSeconds}${ttlSeconds === VIEW_ONCE_TTL ? ' (view once)' : 's'}`);
     log(`Chat: ${targetChatId}`);
 
-    // Convert image to video for ttlSeconds support
-    // (Production Worker only supports ttlSeconds for videos/documents)
-    log('Converting image to video for TTL support...');
-    const { videoBlob, width, height, previewDataUrl } = await convertImageToVideo(imageBlob);
-
-    const filename = `disappearing_${Date.now()}.webm`;
-    const attachment = await buildVideoAttachment(videoBlob, filename, ttlSeconds, width, height, previewDataUrl);
-    log(`Built video attachment: ${JSON.stringify({ size: attachment.size, width, height, hasTtl: !!attachment.ttlSeconds })}`);
+    // Get file extension from mime type
+    const ext = imageBlob.type.split('/')[1] || 'jpg';
+    const filename = `photo_${Date.now()}.${ext}`;
+    const attachment = await buildAttachment(imageBlob, filename, ttlSeconds);
 
     const actions = TelegramApi._getActions();
 
@@ -467,7 +344,7 @@
     // threadId -1 = MAIN_THREAD_ID, type 'thread' = regular chat
     const MAIN_THREAD_ID = -1;
 
-    log('Sending disappearing video (converted from image)...');
+    log('Sending...');
     try {
       sendFn({
         messageList: {
@@ -479,59 +356,8 @@
       });
 
       log('Message dispatched!');
-      log('Note: Sent as a short video due to production TTL limitations for photos.');
-      return true;
-    } catch (e) {
-      error('Failed to send:', e.message);
-      URL.revokeObjectURL(attachment.blobUrl);
-      return false;
-    }
-  }
-
-  /**
-   * Send a regular photo (without disappearing/TTL)
-   * @param {Blob} imageBlob - Image blob
-   * @param {string|number|null} chatId - Chat ID (default: current open chat)
-   */
-  async function sendPhoto(imageBlob, chatId = null) {
-    log('========================================');
-    log('  TelegramSendPhoto (regular)');
-    log('========================================');
-
-    validateImageBlob(imageBlob);
-
-    if (!TelegramApi._getActions) {
-      throw new Error('getActions not found. Cannot send messages.');
-    }
-
-    const targetChatId = chatId || getCurrentChatId();
-    if (!targetChatId) {
-      throw new Error('No chat open. Open a chat or provide chatId.');
-    }
-
-    const ext = imageBlob.type.split('/')[1] || 'jpg';
-    const filename = `photo_${Date.now()}.${ext}`;
-    const attachment = await buildPhotoAttachment(imageBlob, filename);
-
-    const actions = TelegramApi._getActions();
-    const sendFn = actions.sendMessage;
-
-    if (!sendFn) {
-      throw new Error('sendMessage action not found');
-    }
-
-    const MAIN_THREAD_ID = -1;
-
-    try {
-      sendFn({
-        messageList: {
-          chatId: String(targetChatId),
-          threadId: MAIN_THREAD_ID,
-          type: 'thread',
-        },
-        attachments: [attachment],
-      });
-      log('Photo sent!');
+      // Note: We don't revoke blobUrl immediately as the upload is async
+      // The URL will be garbage collected eventually
       return true;
     } catch (e) {
       error('Failed to send:', e.message);
@@ -583,7 +409,6 @@
     };
 
     window.TelegramSendDisappearingPhoto = sendDisappearingPhoto;
-    window.TelegramSendPhoto = sendPhoto;
 
     log('');
     log('========================================');
@@ -595,19 +420,13 @@
     log('  getActions:', !!TelegramApi._getActions);
     log('');
     log('Usage:');
-    log('  // Send disappearing photo (view-once):');
+    log('  // Create or get an image blob, then:');
+    log('  await TelegramSendDisappearingPhoto(imageBlob, 5);');
+    log('');
+    log('  // Example with fetch:');
     log('  const resp = await fetch("https://picsum.photos/400");');
     log('  const blob = await resp.blob();');
     log('  await TelegramSendDisappearingPhoto(blob);');
-    log('');
-    log('  // With custom TTL (in seconds):');
-    log('  await TelegramSendDisappearingPhoto(blob, 10);');
-    log('');
-    log('  // Send regular photo:');
-    log('  await TelegramSendPhoto(blob);');
-    log('');
-    log('Note: Disappearing photos are sent as short videos');
-    log('      due to production Worker TTL limitations.');
     log('');
 
     if (!TelegramApi._getGlobal || !TelegramApi._getActions) {

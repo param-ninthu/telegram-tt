@@ -275,13 +275,14 @@
     const blobUrl = URL.createObjectURL(blob);
     const dims = await getImageDimensions(blob);
     return {
-      blob, blobUrl, filename,
+      blob,
+      blobUrl,
+      filename,
       mimeType: blob.type || 'image/jpeg',
       size: blob.size,
       quick: { width: dims.width, height: dims.height },
       ttlSeconds,
-      shouldSendAsFile: false,
-      shouldSendAsSpoiler: false,
+      uniqueId: `photo_${Date.now()}_${Math.random().toString(36).slice(2)}`,
     };
   }
 
@@ -339,15 +340,30 @@
       throw new Error('sendMessage action not found');
     }
 
-    log('Sending...');
-    sendFn({
-      chatId: targetChatId,
-      attachments: [attachment],
-    });
+    // sendMessage expects messageList: { chatId, threadId, type }
+    // threadId -1 = MAIN_THREAD_ID, type 'thread' = regular chat
+    const MAIN_THREAD_ID = -1;
 
-    URL.revokeObjectURL(attachment.blobUrl);
-    log('SUCCESS!');
-    return true;
+    log('Sending...');
+    try {
+      sendFn({
+        messageList: {
+          chatId: String(targetChatId),
+          threadId: MAIN_THREAD_ID,
+          type: 'thread',
+        },
+        attachments: [attachment],
+      });
+
+      log('Message dispatched!');
+      // Note: We don't revoke blobUrl immediately as the upload is async
+      // The URL will be garbage collected eventually
+      return true;
+    } catch (e) {
+      error('Failed to send:', e.message);
+      URL.revokeObjectURL(attachment.blobUrl);
+      return false;
+    }
   }
 
   async function initialize() {

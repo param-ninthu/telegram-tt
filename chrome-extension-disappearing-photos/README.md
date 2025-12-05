@@ -119,9 +119,9 @@ If the extension isn't working:
 - Open a chat in Telegram Web A before running the command
 - Or provide the chat ID as the third parameter
 
-**CORS errors when downloading images**
-- The image URL must allow cross-origin requests
-- Try using a different image source
+**"Invalid image type"**
+- The Blob must have a valid image MIME type
+- Supported types: image/jpeg, image/png, image/gif, image/webp, image/bmp
 
 ## Technical Details
 
@@ -142,8 +142,7 @@ If the extension isn't working:
 4. **API Exposure**: Once modules are found, they're exposed under `window.TelegramApi`
 
 5. **Helper Function**: `TelegramSendDisappearingPhoto` uses the exposed APIs to:
-   - Download the image from the provided URL
-   - Convert it to a Blob
+   - Validate the provided image Blob
    - Build an attachment object with TTL
    - Call `sendMessage` action to send the photo
 
@@ -152,6 +151,7 @@ If the extension isn't working:
 ```
 chrome-extension-disappearing-photos/
   manifest.json    - Extension manifest (Manifest V3)
+  background.js    - Service worker for extension lifecycle
   content.js       - Content script that injects injected.js
   injected.js      - Main script that hooks into Telegram
   README.md        - This documentation
@@ -169,7 +169,7 @@ chrome-extension-disappearing-photos/
 - This extension only works on `web.telegram.org/a/*`
 - No data is sent to external servers
 - All operations happen locally in your browser
-- The extension requires no special permissions beyond host access
+- Permissions: `tabs` (for detecting Telegram tabs), host access to web.telegram.org
 
 ## License
 

@@ -1,12 +1,18 @@
 {
   "manifest_version": 3,
   "name": "Telegram Disappearing Photos",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Send disappearing (self-destructing) photos in Telegram Web A via DevTools console",
-  "permissions": [],
+  "permissions": [
+    "tabs"
+  ],
   "host_permissions": [
     "https://web.telegram.org/*"
   ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
   "content_scripts": [
     {
       "matches": ["https://web.telegram.org/a/*"],
